@@ -41,10 +41,11 @@ except ImportError as e:
 
 def check_prerequisites(style: str):
     """Checks if necessary checkpoint directories exist based on style."""
+    if not os.path.exists(CKPT_CONVERTER_V2):
+        logging.error(f"V2 Converter checkpoint directory not found: '{CKPT_CONVERTER_V2}'")
+        sys.exit(1)
+
     if style == 'default':
-        if not os.path.exists(CKPT_CONVERTER_V2):
-            logging.error(f"V2 Converter checkpoint directory not found: '{CKPT_CONVERTER_V2}'")
-            sys.exit(1)
         if not os.path.exists(BASE_SE_PATH_V2):
             logging.error(f"V2 Base speaker embedding directory not found: '{BASE_SE_PATH_V2}'")
             sys.exit(1)
@@ -193,11 +194,13 @@ def main():
         if torch.backends.mps.is_available() and device == 'cpu':
             torch.backends.mps.is_available = lambda: False
 
+        # Always use the V2 ToneColorConverter
+        converter = ToneColorConverter(f'{CKPT_CONVERTER_V2}/config.json', device=device)
+        converter.load_ckpt(f'{CKPT_CONVERTER_V2}/checkpoint.pth')
+
         if args.style == 'default':
             # V2 model for default, high-quality synthesis
             logging.info("Using default synthesis with V2 models (MeloTTS).")
-            converter = ToneColorConverter(f'{CKPT_CONVERTER_V2}/config.json', device=device)
-            converter.load_ckpt(f'{CKPT_CONVERTER_V2}/checkpoint.pth')
             tts_model = TTS(language=args.language, device=device)
             
             speaker_key, _ = select_melo_speaker(tts_model, args.speaker)
@@ -213,8 +216,6 @@ def main():
                 logging.error("Styled synthesis is currently only supported for English (EN).")
                 sys.exit(1)
             logging.info(f"Using styled synthesis with style: {args.style}")
-            converter = ToneColorConverter(f'{CKPT_BASE_EN_V1}/config.json', device=device)
-            converter.load_ckpt(f'{CKPT_BASE_EN_V1}/checkpoint.pth')
             tts_model = BaseSpeakerTTS(f'{CKPT_BASE_EN_V1}/config.json', device=device)
             tts_model.load_ckpt(f'{CKPT_BASE_EN_V1}/checkpoint.pth')
             source_se = torch.load(f'{CKPT_BASE_EN_V1}/en_style_se.pth').to(device)
@@ -235,7 +236,7 @@ def main():
             output_path=args.output_path
         )
         
-        success_message = f"""
+        success_message = """
         ===============================================================
         Success! Voice cloning process completed.
         Output saved to: {os.path.abspath(args.output_path)}
@@ -244,7 +245,7 @@ def main():
         print(success_message)
 
     except Exception as e:
-        logging.error(f"An error occurred during the process: {e}", exc_info=True)
+        logging.exception(f"An error occurred during the process: {e}")
         sys.exit(1)
     finally:
         # Step 4: Cleanup
