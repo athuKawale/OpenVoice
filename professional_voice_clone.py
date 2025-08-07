@@ -6,7 +6,7 @@ Professional Voice Cloning Script using OpenVoice and DeepFilterNet.
 
 This script takes an input audio file, a text prompt, and a language,
 and generates a new audio file with the specified text spoken in the voice
-cloned from the input audio.
+cloned from the input audio. It now supports both default and styled synthesis.
 """
 
 import os
@@ -20,14 +20,16 @@ from typing import Optional, Tuple
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Model and Path Configurations ---
-CKPT_CONVERTER = 'checkpoints_v2/converter'
-BASE_SE_PATH = 'checkpoints_v2/base_speakers/ses'
+CKPT_CONVERTER_V2 = 'checkpoints_v2/converter'
+BASE_SE_PATH_V2 = 'checkpoints_v2/base_speakers/ses'
+CKPT_BASE_EN_V1 = 'checkpoints/base_speakers/EN'
 SUPPORTED_LANGUAGES = ['EN', 'ES', 'FR', 'ZH', 'JP', 'KR']
+SUPPORTED_STYLES = ['default', 'whispering', 'cheerful', 'terrified', 'angry', 'sad', 'friendly']
 
 # --- Lazy Import Dependencies ---
 try:
     from df.enhance import enhance, init_df, load_audio, save_audio
-    from openvoice.api import ToneColorConverter
+    from openvoice.api import ToneColorConverter, BaseSpeakerTTS
     from melo.api import TTS
     from openvoice import se_extractor
 except ImportError as e:
@@ -37,16 +39,20 @@ except ImportError as e:
     sys.exit(1)
 
 
-def check_prerequisites():
-    """Checks if necessary checkpoint directories exist."""
-    if not os.path.exists(CKPT_CONVERTER):
-        logging.error(f"Converter checkpoint directory not found: '{CKPT_CONVERTER}'")
-        logging.error("Please download the OpenVoiceV2 checkpoints and place them correctly.")
-        sys.exit(1)
-    if not os.path.exists(BASE_SE_PATH):
-        logging.error(f"Base speaker embedding directory not found: '{BASE_SE_PATH}'")
-        logging.error("Please download the OpenVoiceV2 checkpoints and place them correctly.")
-        sys.exit(1)
+def check_prerequisites(style: str):
+    """Checks if necessary checkpoint directories exist based on style."""
+    if style == 'default':
+        if not os.path.exists(CKPT_CONVERTER_V2):
+            logging.error(f"V2 Converter checkpoint directory not found: '{CKPT_CONVERTER_V2}'")
+            sys.exit(1)
+        if not os.path.exists(BASE_SE_PATH_V2):
+            logging.error(f"V2 Base speaker embedding directory not found: '{BASE_SE_PATH_V2}'")
+            sys.exit(1)
+    else:
+        if not os.path.exists(CKPT_BASE_EN_V1):
+            logging.error(f"V1 English base speaker directory not found: '{CKPT_BASE_EN_V1}'")
+            logging.error("Styled synthesis requires V1 checkpoints.")
+            sys.exit(1)
 
 
 def setup_arg_parser() -> argparse.ArgumentParser:
@@ -72,8 +78,13 @@ def setup_arg_parser() -> argparse.ArgumentParser:
         help="Path to save the generated audio file (e.g., 'output/cloned.wav')."
     )
     parser.add_argument(
+        "--style", type=str, default='default', choices=SUPPORTED_STYLES,
+        help=f"Voice style for the synthesis. Supported: {', '.join(SUPPORTED_STYLES)}.\n"
+             "Note: All styles except 'default' are English-only and use V1 models."
+    )
+    parser.add_argument(
         "-s", "--speaker", type=str, required=False, default=None,
-        help="Optional: The base speaker from MeloTTS. Defaults to the first available speaker for the language."
+        help="Optional: The base speaker from MeloTTS (for default style only)."
     )
     parser.add_argument(
         "--speed", type=float, required=False, default=1.0,
@@ -83,15 +94,7 @@ def setup_arg_parser() -> argparse.ArgumentParser:
 
 
 def denoise_audio(input_path: str) -> str:
-    """
-    Removes background noise from an audio file using DeepFilterNet.
-
-    Args:
-        input_path: Path to the noisy audio file.
-
-    Returns:
-        Path to the denoised (enhanced) audio file.
-    """
+    """Removes background noise from an audio file using DeepFilterNet."""
     logging.info(f"Denoising audio file: {input_path}")
     if not os.path.exists(input_path):
         raise FileNotFoundError(f"Input audio file not found at: {input_path}")
@@ -109,8 +112,8 @@ def denoise_audio(input_path: str) -> str:
     return denoised_path
 
 
-def select_speaker(melo_tts: TTS, target_speaker: Optional[str]) -> Tuple[str, int]:
-    """Selects the speaker, defaulting to the first available if the target is not found."""
+def select_melo_speaker(melo_tts: TTS, target_speaker: Optional[str]) -> Tuple[str, int]:
+    """Selects the speaker for MeloTTS, defaulting to the first available."""
     speaker_ids = melo_tts.hps.data.spk2id
     available_speakers = list(speaker_ids.keys())
 
@@ -119,8 +122,7 @@ def select_speaker(melo_tts: TTS, target_speaker: Optional[str]) -> Tuple[str, i
         logging.info(f"Using specified speaker: '{speaker_key}'")
     else:
         if target_speaker:
-            logging.warning(f"Speaker '{target_speaker}' not found for the selected language.")
-            logging.warning(f"Available speakers: {available_speakers}")
+            logging.warning(f"Speaker '{target_speaker}' not found. Available: {available_speakers}")
         speaker_key = available_speakers[0]
         logging.info(f"Using default speaker: '{speaker_key}'")
         
@@ -129,40 +131,35 @@ def select_speaker(melo_tts: TTS, target_speaker: Optional[str]) -> Tuple[str, i
 
 def clone_voice(
     tone_color_converter: ToneColorConverter,
-    melo_tts: TTS,
+    tts_model,
+    source_se: torch.Tensor,
     text: str,
     reference_audio: str,
-    target_speaker: Optional[str],
+    style_or_speaker: str,
+    language: str,
     speed: float,
-    output_path: str,
-    device: str
+    output_path: str
 ):
     """Processes the audio and performs voice cloning."""
     # 1. Extract tone color embedding from the reference audio.
     logging.info("Extracting tone color embedding from reference audio.")
     target_se, _ = se_extractor.get_se(reference_audio, tone_color_converter, vad=True)
 
-    # 2. Select a base speaker.
-    speaker_key, speaker_id = select_speaker(melo_tts, target_speaker)
-    formatted_speaker_key = speaker_key.lower().replace('_', '-')
-
-    # 3. Load the source speaker embedding.
-    source_se_path = os.path.join(BASE_SE_PATH, f'{formatted_speaker_key}.pth')
-    if not os.path.exists(source_se_path):
-        raise FileNotFoundError(f"Base speaker embedding not found at: {source_se_path}")
-    source_se = torch.load(source_se_path, map_location=device)
-
-    # 4. Synthesize the base audio.
+    # 2. Synthesize the base audio.
     logging.info(f"Synthesizing base audio with text: '{text}'")
     output_dir = os.path.dirname(output_path)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
-    
     src_path = os.path.join(output_dir or '.', 'tmp_base_audio.wav')
-    
-    melo_tts.tts_to_file(text, speaker_id, src_path, speed=speed)
 
-    # 5. Apply tone color conversion.
+    # Use the appropriate TTS model
+    if isinstance(tts_model, TTS):  # MeloTTS for default style
+        _, speaker_id = select_melo_speaker(tts_model, style_or_speaker)
+        tts_model.tts_to_file(text, speaker_id, src_path, speed=speed)
+    else:  # BaseSpeakerTTS for styled synthesis
+        tts_model.tts(text, src_path, speaker=style_or_speaker, language=language, speed=speed)
+
+    # 3. Apply tone color conversion.
     logging.info("Applying tone color conversion to create the final audio.")
     tone_color_converter.convert(
         audio_src_path=src_path,
@@ -172,49 +169,72 @@ def clone_voice(
         message="@MyShell"  # Watermark
     )
 
-    # 6. Clean up temporary base audio file.
+    # 4. Clean up temporary base audio file.
     os.remove(src_path)
     logging.info("Cleaned up temporary base audio file.")
 
 
 def main():
     """Main function to execute the voice cloning pipeline."""
-    check_prerequisites()
-    
     parser = setup_arg_parser()
     args = parser.parse_args()
+
+    check_prerequisites(args.style)
 
     denoised_audio_path = None
     try:
         # Step 1: Denoise Input Audio
         denoised_audio_path = denoise_audio(args.input_audio)
 
-        # Step 2: Initialize Models
+        # Step 2: Initialize Models based on style
         logging.info("Initializing models...")
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
         
-        # Handle a specific issue with MPS on CPU
         if torch.backends.mps.is_available() and device == 'cpu':
             torch.backends.mps.is_available = lambda: False
 
-        converter = ToneColorConverter(f'{CKPT_CONVERTER}/config.json', device=device)
-        converter.load_ckpt(f'{CKPT_CONVERTER}/checkpoint.pth')
-        tts_model = TTS(language=args.language, device=device)
+        if args.style == 'default':
+            # V2 model for default, high-quality synthesis
+            logging.info("Using default synthesis with V2 models (MeloTTS).")
+            converter = ToneColorConverter(f'{CKPT_CONVERTER_V2}/config.json', device=device)
+            converter.load_ckpt(f'{CKPT_CONVERTER_V2}/checkpoint.pth')
+            tts_model = TTS(language=args.language, device=device)
+            
+            speaker_key, _ = select_melo_speaker(tts_model, args.speaker)
+            formatted_speaker_key = speaker_key.lower().replace('_', '-')
+            source_se_path = os.path.join(BASE_SE_PATH_V2, f'{formatted_speaker_key}.pth')
+            source_se = torch.load(source_se_path, map_location=device)
+            style_or_speaker = args.speaker
+            language_for_tts = args.language
+
+        else:
+            # V1-style model for styled synthesis (English only)
+            if args.language != 'EN':
+                logging.error("Styled synthesis is currently only supported for English (EN).")
+                sys.exit(1)
+            logging.info(f"Using styled synthesis with style: {args.style}")
+            converter = ToneColorConverter(f'{CKPT_BASE_EN_V1}/config.json', device=device)
+            converter.load_ckpt(f'{CKPT_BASE_EN_V1}/checkpoint.pth')
+            tts_model = BaseSpeakerTTS(f'{CKPT_BASE_EN_V1}/config.json', device=device)
+            tts_model.load_ckpt(f'{CKPT_BASE_EN_V1}/checkpoint.pth')
+            source_se = torch.load(f'{CKPT_BASE_EN_V1}/en_style_se.pth').to(device)
+            style_or_speaker = args.style
+            language_for_tts = 'English'
 
         # Step 3: Process and Clone Voice
         logging.info("Starting the voice cloning process...")
         clone_voice(
             tone_color_converter=converter,
-            melo_tts=tts_model,
+            tts_model=tts_model,
+            source_se=source_se,
             text=args.text,
             reference_audio=denoised_audio_path,
-            target_speaker=args.speaker,
+            style_or_speaker=style_or_speaker,
+            language=language_for_tts,
             speed=args.speed,
-            output_path=args.output_path,
-            device=device
+            output_path=args.output_path
         )
         
-        # --- Success Message ---
         success_message = f"""
         ===============================================================
         Success! Voice cloning process completed.
